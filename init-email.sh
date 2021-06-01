@@ -92,8 +92,22 @@ while true; do
 	esac
 done
 
+## add new user
 if [ ! -z $_user ]; then
-	echo "adding user"
+	valid_name="^(no?|q(uit)?)$"
+
+	read -p "User to add (no/quit to exit) > " input
+	input=$(echo $input | tr -cd "[:alnum:]")
+
+	while [ ! -z "$input" ] && \
+		!(echo "$input" | grep -E $valid_name) && \
+		!(grep -E "^$input:" $virt_passwd >/dev/null); do
+
+		add_virt_user $input
+
+		read -p "User to add (q to quit) > " input
+		input=$(echo $input | tr -cd "[:alnum:]")
+	done
 	exit 0
 fi
 
