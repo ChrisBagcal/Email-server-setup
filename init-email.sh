@@ -1,17 +1,15 @@
 #!/bin/sh
 
+script_name="${0##*/}"
 systemd_unit_path=/etc/systemd/system
 virtual_user=vmail
 virtual_home=/var/$virtual_user
 emailtodo=emailtodo.txt
 dovecotdir=/etc/dovecot
-dkimkeys=/etc/dkimkeys
 selector=mail
-opendmarcconf=/etc/opendmarc.conf
-opendkimconf=/etc/opendkim.conf
 virt_passwd=$dovecotdir/passwd
 localhost=127.0.0.1
-OS=$(awk '/^ID=/{ printf "%s", substr($1, 4) }' /etc/os-release)
+postfix_queue_dir=/var/spool/postfix
 
 POSTFIX=/sbin/postfix
 
@@ -73,21 +71,31 @@ mkmaildir() {
 }
 
 ## sanity tests
-if [ "$USER" != "root" ]; then
-	echo "${0##*/}: run as root" >&2
-	exit 1
-fi
+[ "$USER" != "root" ] && { echo "$script_name: run as root" >&2; exit 1; }
 [ -d $dovecotdir ] || cp -r /usr/share/doc/dovecot/example-config/ $dovecotdir
 [ -d $dovecotdir/private/ ] || mkdir $dovecotdir/private/
-if [ ! -d $dkimkeys ]; then
-	mkdir $dkimkeys
-	chmod 700 $dkimkeys
-	chown -R opendkim:opendkim $dkimkeys
-fi
-postfix_queue_dir=/var/spool/postfix
 [ -d $postfix_queue_dir/etc/ ] || mkdir $postfix_queue_dir/etc/
 [ -f $postfix_queue_dir/etc/services ] || cp /etc/services $postfix_queue_dir/etc/services
 [ -f $postfix_queue_dir/etc/resolv.conf ] || cp /etc/resolv.conf $postfix_queue_dir/etc/resolv.conf
+
+## Argument parsing
+args=$(getopt --name "$script_name" "u" "$@") || exit 1
+eval set -- "$args"
+unset args
+
+while true; do
+	case $1 in
+		"--") break ;;	
+		"-u")	_user="true"
+			shift 1 
+			continue ;;
+	esac
+done
+
+if [ ! -z $_user ]; then
+	echo "adding user"
+	exit 0
+fi
 
 # basic config
 [ -d $systemd_unit_path/postfix.service.d/ ] || mkdir $systemd_unit_path/postfix.service.d/
@@ -100,9 +108,7 @@ ConditionPathExists=/etc/postfix/main.cf
 [Service]
 ExecStart=
 ExecStart=/usr/sbin/postfix start
-ExecStop=
 ExecStop=/usr/sbin/postfix stop
-ExecReload=
 ExecReload=/usr/sbin/postfix reload
 RemainAfterExit=no
 PIDFile=/var/spool/postfix/pid/master.pid
@@ -161,9 +167,18 @@ postconf -e \
 #+master.cf stuff
 
 ## opendkim
+dkimkeys=/etc/dkimkeys
 dkimverify=/etc/postfix/dkim-verify.txt
-dkimprivkey=/etc/dkimkeys/dkim.key
+dkimprivkey=$dkimkeys/dkim.key
 dkimport=8892
+opendkimconf=/etc/opendkim.conf
+
+## missing home for dkim keys
+if [ ! -d $dkimkeys ]; then
+	mkdir $dkimkeys
+	chmod 700 $dkimkeys
+	chown -R opendkim:opendkim $dkimkeys
+fi
 
 openssl genpkey -algorithm RSA -out ${dkimprivkey}
 
@@ -174,7 +189,7 @@ echo '## '$opendkimconf'
 Syslog			yes
 UMask			007
 
-# Sign for example.com with key in /etc/dkimkeys/dkim.key using
+# Sign for example.com with key in '$dkimprivkey' using
 # selector '2007' (e.g. 2007._domainkey.example.com)
 Domain			'${dkimverify}'
 KeyFile			'${dkimprivkey}'
@@ -220,6 +235,7 @@ WantedBy=multi-user.target' > $systemd_unit_path/opendkim.service.d/override.con
 
 ## opendmarc
 dmarcport=$(( $dkimport + 1 ))
+opendmarcconf=/etc/opendmarc.conf
 # conf file
 echo '## '$opendmarcconf'
 #PidFile /run/opendmarc/opendmarc.pid (uncomment on debian)
@@ -253,10 +269,6 @@ Restart=on-failure
 WantedBy=multi-user.target' > $systemd_unit_path/opendmarc.service.d/override.conf
 
 smtpd_milters=${smtpd_milters},inet:$localhost:$dmarcport
-
-## spamassassin
-# TODO os-dependent
-#sa-update
 
 # dns records
 echo ' -dmarc dns txt record-
@@ -455,7 +467,8 @@ service stats {
 echo '# 90-sieve.conf
 plugin {
   sieve = file:~/sieve/;active=~/sieve/dovecot.sieve
-  
+
+  # use spamtest extention
   sieve_extensions = +spamtest +spamtestplus
   sieve_spamtest_status_type = "strlen"
   sieve_spamtest_status_header = X-Spam-Level
@@ -463,6 +476,9 @@ plugin {
   sieve_spamtest_max_header = \
   X-Spam-Status: [[:alnum:]]+, score=-?[[:digit:]]+\.[[:digit:]] required=([[:digit:]]+\.[[:digit:]])
 }' > $dovecotdir/conf.d/90-sieve.conf
+
+## spamassassin
+sa-update
 
 ## master.cf
 #	+set postscreen
@@ -479,11 +495,11 @@ echo '# Postfix master process configuration file.  For details on the format
 #               (yes)   (yes)   (no)    (never) (100)
 # ==========================================================================
 #smtp      inet  n       -       y       -       -       smtpd
+## Use postscreen over basic smtpd
 smtp      inet  n       -       y       -       1       postscreen
 smtpd     pass  -       -       y       -       -       smtpd
 dnsblog   unix  -       -       y       -       0       dnsblog
 tlsproxy  unix  -       -       y       -       0       tlsproxy
-'"#8039"' inet  n       -       y       -       -       smtpd
 submission inet  n       -       y       -       -       smtpd
   -o syslog_name=postfix/submission
   -o smtpd_tls_security_level=encrypt
@@ -539,22 +555,9 @@ postlog   unix-dgram n  -       n       -       1       postlogd
 # and other message envelope options.
 # ====================================================================
 #
-# maildrop. See the Postfix MAILDROP_README file for details.
-# Also specify in main.cf: maildrop_destination_recipient_limit=1
-#
-#maildrop  unix  -       n       n       -       -       pipe
-#  flags=DRhu user=vmail argv=/usr/bin/maildrop -d ${recipient}
-#
-# ====================================================================
-#
-# See the Postfix UUCP_README file for configuration details.
-#
-#uucp      unix  -       n       n       -       -       pipe
-#  flags=Fqhu user=uucp argv=uux -r -n -z -a$sender - $nexthop!rmail ($recipient)
-#
 ## spamassassin + dovecot
 dovecot   unix  -       n       n       -       -       pipe
-  flags=DRhu user='$virtual_user':'$virtual_user' argv=/usr/bin/vendor_perl/spamc 
+  flags=DRhu user='$virtual_user':'$virtual_user' argv='$(which spamc)'
   -u spamd -e /usr/lib/dovecot/dovecot-lda -f ${sender} -d ${user}' > /etc/postfix/master.cf
 
 
