@@ -1,0 +1,7 @@
+# .gitignore
+
+doc
+emailtodo.txt
+firewall-vps.sh
+letters
+local-emailban.sh
